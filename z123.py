@@ -1,180 +1,216 @@
 from pathlib import Path
 import pandas as pd
 import spacy
+import numpy as np
 from collections import Counter, defaultdict
 import nltk
-from nltk.corpus import wordnet
+from nltk.corpus import wordnet, stopwords
 import pyinflect
 
+# ==================== 配置常量 ====================
 CEFR_LEVELS = ["A1", "A2", "B1", "B2", "C1", "C2"]
+CEFR_VALUES = {lvl: i * 0.2 for i, lvl in enumerate(CEFR_LEVELS)}
 BATCH_SIZE = 1024
-MIN_APPEARANCE_COUNT = 10
+SIMILARITY_THRESHOLD = 0.5
+MIN_DISTANCE = 0.2
 
-# Convenient for direct comparison of CEFR levels
-class CEFRLevel:
-    def __init__(self, cefr):
-        if cefr not in CEFR_LEVELS:
-            # default cefr for unkown
-            self.name = "A1"
-        else:
-            self.name = cefr
-        self.index = CEFR_LEVELS.index(self.name)
-
-    def __gt__(self, other): return self.index > other.index
-    def __lt__(self, other): return self.index < other.index
-    def __ge__(self, other): return self.index >= other.index
-    def __le__(self, other): return self.index <= other.index
-    def __eq__(self, other): return self.index == other.index
-    
-    def __str__(self): return self.name
+try:
+    STOPWORDS = set(stopwords.words('english'))
+except LookupError:
+    nltk.download('stopwords')
+    nltk.download('wordnet')
+    nltk.download('omw-1.4')
+    STOPWORDS = set(stopwords.words('english'))
 
 class CEFRManager:
     def __init__(self, path="data.csv"):
         self.df = self.load_training_data(path)
-        self.cefr_word_counts = {level: Counter() for level in CEFR_LEVELS}
-        self.word_best_cefr = defaultdict(lambda: "A1") 
-        # 存储单词在各等级中的出现百分比
-        self.word_cefr_percentage = defaultdict(lambda: {level: 0.0 for level in CEFR_LEVELS})
-        self.model = spacy.load("en_core_web_sm")
-        self.create_tables()
+        self.word_cefr_freq = {lvl: Counter() for lvl in CEFR_LEVELS}
+        self.word_weighted_scores = {} 
+        
+        try:
+            self.model = spacy.load("en_core_web_md")
+        except OSError:
+            spacy.cli.download("en_core_web_md")
+            self.model = spacy.load("en_core_web_md")
+            
+        self.build_statistics()
 
     def load_training_data(self, path):
         file_path = Path(path)
-        if not file_path.exists():
-            raise FileNotFoundError("data.csv not found.")
-        df = pd.read_csv(file_path)
-        return df
+        if not file_path.exists(): raise FileNotFoundError("data.csv not found.")
+        return pd.read_csv(file_path)
     
-    def create_tables(self):
+    def softmax(self, x):
+        """标准 Softmax 实现"""
+        if np.all(x == 0): return np.zeros_like(x)
+        e_x = np.exp(x - np.max(x))
+        return e_x / e_x.sum()
+
+    def build_statistics(self):
+        """计算语料库中每个词的加权 CEFR 分数"""
         pipes = self.model.pipe(self.df['text'].astype(str), batch_size=BATCH_SIZE, disable=["ner"])
-        word_cefr_freq = defaultdict(lambda: defaultdict(int))
-        
         for doc, cefr in zip(pipes, self.df['cefr_level']):
             tokens = [token.lemma_.lower() for token in doc if token.is_alpha]
-            self.cefr_word_counts[cefr].update(tokens)
-            for t in tokens:
-                word_cefr_freq[t][cefr] += 1
+            self.word_cefr_freq[cefr].update(tokens)
 
-        for word, level_counts in word_cefr_freq.items():
-            total_count = sum(level_counts.values())
-            if total_count > 0:
-                for level in CEFR_LEVELS:
-                    self.word_cefr_percentage[word][level] = level_counts.get(level, 0) / total_count
+        all_words = set()
+        for lvl in CEFR_LEVELS: all_words.update(self.word_cefr_freq[lvl].keys())
 
-            best_level = max(CEFR_LEVELS, key=lambda x: (level_counts.get(x, 0), -CEFR_LEVELS.index(x)))
-            if level_counts.get(best_level, 0) > 0:
-                self.word_best_cefr[word] = best_level
+        for word in all_words:
+            freqs = np.array([self.word_cefr_freq[lvl][word] for lvl in CEFR_LEVELS], dtype=float)
+            total_freq = freqs.sum()
+            
+            if total_freq == 0:
+                self.word_weighted_scores[word] = 0.0
+            else:
+                # --- 核心修改：先算百分比，再算 Softmax ---
+                percentages = freqs / total_freq
+                weights = self.softmax(percentages)
+                # ---------------------------------------
+                
+                weighted_score = sum(weights[i] * CEFR_VALUES[CEFR_LEVELS[i]] for i in range(len(CEFR_LEVELS)))
+                self.word_weighted_scores[word] = weighted_score
 
-    def check(self, token):
-        word_str = token.lemma_.lower() if hasattr(token, 'lemma_') else str(token).lower()
-        percentages = self.word_cefr_percentage.get(word_str)
-        if not percentages:
+    def check(self, word):
+        """交互式 Check 函数：反映改进后的百分比 Softmax 逻辑"""
+        word = word.lower()
+        freqs = np.array([self.word_cefr_freq[lvl][word] for lvl in CEFR_LEVELS], dtype=float)
+        total_freq = freqs.sum()
+        
+        print(f"\n{'='*15} CEFR Analysis: '{word}' {'='*15}")
+        if total_freq == 0:
+            print(f"Result: Word '{word}' not found in data.csv")
             return
-        print(f"Token: {word_str}")
-        for level in CEFR_LEVELS:
-            pct = percentages[level] * 100
-            print(f"{level}-{pct:>6.2f}%  ", end="")
-        print("")
 
-    def get_cefr(self, word_str):
-        lvl_str = self.word_best_cefr.get(word_str.lower(), "A1")
-        return CEFRLevel(lvl_str)
+        percentages = freqs / total_freq
+        weights = self.softmax(percentages)
+        score = self.word_weighted_scores.get(word, 0.0)
 
-    def get_synonyms(self, lemma, pos):
-        match pos:
-            case "NOUN": pos = wordnet.NOUN
-            case "VERB": pos = wordnet.VERB
-            case "ADJ":  pos = wordnet.ADJ
-            case "ADV":  pos = wordnet.ADV
-            case _: return set()
+        print(f"{'Level':<8} | {'Freq':<6} | {'Pct %':<8} | {'Softmax Weight':<15}")
+        print("-" * 55)
+        for i, lvl in enumerate(CEFR_LEVELS):
+            print(f"{lvl:<8} | {int(freqs[i]):<6} | {percentages[i]*100:<7.2f}% | {weights[i]:<15.4f}")
+        
+        print("-" * 55)
+        print(f"Final Weighted CEFR Score: {score:.4f}")
+        closest_lvl = min(CEFR_LEVELS, key=lambda l: abs(CEFR_VALUES[l] - score))
+        print(f"Mapped Category: {closest_lvl}")
 
-        synonyms = set()
-        for syn in wordnet.synsets(lemma, pos=pos):
-            # 1. 获取直接同义词 (Lemmas)
-            for i in syn.lemmas():
-                candidate = i.name().replace('_', ' ').lower()
-                if candidate != lemma:
-                    synonyms.add(candidate)
-            
-            # 2. 获取上位词 (Hypernyms)
-            for hyper in syn.hypernyms():
-                for i in hyper.lemmas():
-                    candidate = i.name().replace('_', ' ').lower()
-                    if candidate != lemma:
-                        synonyms.add(candidate)
-                        
-        # print("===================列举同义词中====================")
-        # for syn in synonyms:
-        #     self.check(syn)
-        return synonyms
+    def get_best_synset_lesk(self, token, context_lemmas):
+        lemma = token.lemma_.lower()
+        wn_pos = {"VERB": wordnet.VERB, "ADJ": wordnet.ADJ, "ADV": wordnet.ADV, "NOUN": wordnet.NOUN}.get(token.pos_)
+        if not wn_pos: return None
+        synsets = wordnet.synsets(lemma, pos=wn_pos)
+        if not synsets: return None
+        
+        context_set = set(context_lemmas) - STOPWORDS
+        best_ss, max_overlap = synsets[0], -1
+        for ss in synsets:
+            signature = set(ss.definition().lower().replace(',', '').split())
+            for example in ss.examples():
+                signature.update(example.lower().replace(',', '').split())
+            overlap = len(signature.intersection(context_set))
+            if overlap > max_overlap:
+                max_overlap, best_ss = overlap, ss
+        return best_ss
 
-    def get_replacement(self, ori_token, tar_cefr, if_down):
+    def get_replacement(self, ori_token, context_lemmas, tar_cefr_val):
         old_lemma = ori_token.lemma_.lower()
-        pos = ori_token.pos_
-        tag = ori_token.tag_
+        old_score = self.word_weighted_scores.get(old_lemma, 1.0)
         
-        synonyms = self.get_synonyms(old_lemma, pos)
-        if not synonyms: return None
+        candidates = set()
+        best_ss = self.get_best_synset_lesk(ori_token, context_lemmas)
         
-        candidates = list(synonyms) + [old_lemma]
+        synsets = [best_ss] if best_ss else wordnet.synsets(old_lemma)
+        for ss in synsets:
+            for l in ss.lemmas():
+                cand = l.name().replace('_', ' ').lower()
+                if cand != old_lemma: candidates.add(cand)
+            if hasattr(ss, 'hypernyms'):
+                for hyper in ss.hypernyms():
+                    for l in hyper.lemmas():
+                        cand = l.name().replace('_', ' ').lower()
+                        if cand != old_lemma: candidates.add(cand)
 
-        valid_candidates = []
-        for cand in candidates:
-            # 统计该候选词在 data.csv 中的全等级总出现次数
-            total_cand_count = sum(self.cefr_word_counts[lvl].get(cand, 0) for lvl in CEFR_LEVELS)
+        if not candidates: return None
+
+        cand_list = list(candidates)
+        cand_docs = list(self.model.pipe(cand_list))
+        valid_options = []
+
+        print(f"\n[DEBUG] Word: '{ori_token.text}' (Score: {old_score:.3f}) -> Target: {tar_cefr_val:.2f}")
+        print(f"{'Candidate':<18} | {'Simil.':<8} | {'Score':<8} | {'Dist.':<8} | {'Status'}")
+        print("-" * 65)
+
+        for cand_str, c_doc in zip(cand_list, cand_docs):
+            if not ori_token.has_vector or not c_doc[0].has_vector: continue
             
-            # 如果候选词够活跃，或者是原词本身，则视为有效候选
-            if total_cand_count >= MIN_APPEARANCE_COUNT or cand == old_lemma:
-                valid_candidates.append(cand)
-        
-        if not valid_candidates: return None
-        
-        # 从有效候选词中找到目标等级占比最高的
-        best_syn = max(valid_candidates, key=lambda x: self.word_cefr_percentage[x].get(tar_cefr.name, 0))
-        
-        if best_syn == old_lemma:
-            return None
-        # --- 优化结束 ---
+            sim = ori_token.similarity(c_doc[0])
+            cand_score = self.word_weighted_scores.get(cand_str)
+            
+            if cand_score is None:
+                print(f"{cand_str:<18} | {sim:<8.2f} | {'N/A':<8} | {'N/A':<8} | SKIP: No Data")
+                continue
 
-        # 变形逻辑
+            dist = abs(cand_score - tar_cefr_val)
+            status = "OK"
+            if sim < SIMILARITY_THRESHOLD: status = "SKIP: Sim"
+            elif cand_score >= old_score: status = "SKIP: Harder"
+            elif dist > MIN_DISTANCE: status = "SKIP: Dist"
+
+            print(f"{cand_str:<18} | {sim:<8.2f} | {cand_score:<8.3f} | {dist:<8.3f} | {status}")
+
+            if status == "OK":
+                valid_options.append((cand_str, cand_score))
+
+        if not valid_options:
+            return None
+
+        best_syn, best_score = min(valid_options, key=lambda x: abs(x[1] - tar_cefr_val))
+        print(f"==> SELECTED: '{best_syn}' (Final Score: {best_score:.3f})")
+
+        tag = ori_token.tag_
         original_lemma_hash = ori_token.lemma
         ori_token.lemma_ = best_syn
         replacement_text = ori_token._.inflect(tag)
         ori_token.lemma = original_lemma_hash
         
-        if not replacement_text:
-            replacement_text = best_syn
-        
-        return replacement_text + ori_token.whitespace_
+        return (replacement_text if replacement_text else best_syn) + ori_token.whitespace_
 
-    def transform(self, sentence, src_cefr, tar_cefr):
+    def transform(self, sentence, target_level):
         doc = self.model(sentence)
-        src_cefr = CEFRLevel(src_cefr)
-        tar_cefr = CEFRLevel(tar_cefr)
-        if_down = src_cefr > tar_cefr
+        context_lemmas = [t.lemma_.lower() for t in doc if t.is_alpha]
+        tar_cefr_val = CEFR_VALUES.get(target_level, 0.2)
         
-        transformed_tokens = []
+        transformed = []
         for token in doc:
-            if token.is_alpha:
-                # self.check(token)
-                rep = self.get_replacement(token, tar_cefr, if_down)
-                transformed_tokens.append(rep if rep else token.text_with_ws)
+            if token.is_alpha and token.pos_ in ["VERB", "ADJ", "ADV", "NOUN"]:
+                rep = self.get_replacement(token, context_lemmas, tar_cefr_val)
+                transformed.append(rep if rep else token.text_with_ws)
             else:
-                transformed_tokens.append(token.text_with_ws)
+                transformed.append(token.text_with_ws)
+        return "".join(transformed).strip()
 
-        return "".join(transformed_tokens).strip()
-
+# ==================== 全局入口 ====================
 manager = None
 
 def transform_sentence(sentence, source_level, target_level):
     global manager
     if manager is None:
         manager = CEFRManager("data.csv")
-    if source_level not in CEFR_LEVELS:
-        raise ValueError(f"Invalid source CEFR level: {source_level}")
-    if target_level not in CEFR_LEVELS:
-        raise ValueError(f"Invalid target CEFR level: {target_level}")
-
+    
     if source_level == target_level:
-        return sentence        
-    return manager.transform(sentence, source_level, target_level)
+        result = sentence
+    else:
+        result = manager.transform(sentence, target_level)
+    
+    print(f"\nFinal Result: {result}")
+    
+    # 交互式 Check
+    while True:
+        user_word = input("\n[Check Mode] 输入单词查询分布 (或 'end' 退出): ").strip().lower()
+        if user_word == 'end': break
+        if user_word: manager.check(user_word)
+            
+    return result
